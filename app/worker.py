@@ -39,7 +39,8 @@ def process_export(conn, export_id, me, fencing):
 
     export = store.get_export(conn, export_id)
     data = render_artifact_bytes(export)
-    data = artifacts.cache_rendered(export["rules_digest"], data)
+    # The artifact's bytes are identity-bound to this frozen decision.
+    artifacts.check_identity(data, export)
     digest = hashlib.sha256(data).hexdigest()
     tmp = artifacts.tmp_path(export_id, uuid.uuid4().hex[:8])
 
@@ -70,6 +71,8 @@ def process_export(conn, export_id, me, fencing):
             store.journal(conn, export_id, me, "verify_failed", tmp)
             store.requeue(conn, export_id, me, "digest mismatch after staging")
         return "verify_failed"
+    with open(tmp, "rb") as fh:
+        artifacts.check_identity(fh.read(), export)
 
     # Fencing: only the valid lease holder may publish.
     if not store.check_lease(conn, lease_resource(export_id), me, fencing):
@@ -77,15 +80,78 @@ def process_export(conn, export_id, me, fencing):
             store.journal(conn, export_id, me, "lease_lost", None)
         return "lease_lost"
 
-    via = artifacts.publish(tmp, artifacts.published_path(export_id), digest)
+    pub = artifacts.published_path(export_id)
+    via = artifacts.publish(tmp, pub, digest)
+    # Never mark PUBLISHED on bytes that do not hash right or carry another
+    # export's identity -- the file at the final path is what gets served.
+    with open(pub, "rb") as fh:
+        served = fh.read()
+    if hashlib.sha256(served).hexdigest() != digest:
+        raise artifacts.DigestMismatch("published file digest differs from staged digest")
+    artifacts.check_identity(served, export)
     with store.immediate(conn):
-        store.record_artifact(conn, export_id, "published", artifacts.published_path(export_id), digest)
-        store.mark_published(conn, export_id, digest, artifacts.published_path(export_id), me, via)
+        store.record_artifact(conn, export_id, "published", pub, digest)
+        store.mark_published(conn, export_id, digest, pub, me, via)
     return "published"
+
+
+# Per-process memo of the last-verified published-file signature
+# (inode, mtime_ns, size). Frozen decisions never change, so an unchanged
+# signature means the artifact cannot have changed; a restart (or an
+# os.replace during repair) drops/misses the marker and re-verifies fully.
+_HEALTH_MARKERS = {}
+
+
+def _signature(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def reconcile_tick(conn, me):
+    """Scan PUBLISHED rows and converge any with wrong/missing artifacts.
+
+    Healthy steady state costs one stat per export (file content is only read
+    and hashed when the signature changed or on first sight after a restart);
+    rows that fail the diagnosis take a lease and get repaired.
+    Returns True when a repair was performed.
+    """
+    did_work = False
+    for row in store.published_exports(conn):
+        export_id = row["export_id"]
+        pub = artifacts.published_path(export_id)
+        sig = _signature(pub)
+        if sig is not None and _HEALTH_MARKERS.get(export_id) == sig:
+            continue
+        export = store.get_export(conn, export_id)
+        data = render_artifact_bytes(export)
+        expected_digest = hashlib.sha256(data).hexdigest()
+        if artifacts.diagnose_published(export, expected_digest) is None:
+            if sig is not None:
+                _HEALTH_MARKERS[export_id] = sig
+            else:
+                _HEALTH_MARKERS.pop(export_id, None)
+            continue
+        fencing = store.acquire_lease(conn, lease_resource(export_id), me, config.lease_ttl())
+        if fencing is None:
+            continue
+        try:
+            result = recovery.reconcile_published(conn, export_id, me)
+            did_work = did_work or result == "converged"
+            if result == "converged":
+                _HEALTH_MARKERS.pop(export_id, None)
+        finally:
+            store.release_lease(conn, lease_resource(export_id), me, fencing)
+    return did_work
 
 
 def tick(conn, me):
     did_work = False
+    # Terminal rows first: a mispublished artifact must converge to its own,
+    # verifiable bytes (without ever leaving PUBLISHED).
+    did_work = reconcile_tick(conn, me) or did_work
     # Recover exports whose owner vanished (lease expired or absent).
     for row in store.stuck_exports(conn):
         export_id = row["export_id"]
@@ -117,6 +183,13 @@ def run_forever(me=None):
     conn = store.connect()
     store.init_db(conn)
     recovery.sweep_orphans(conn, me)
+    # After a restart, converge any previously mispublished artifacts before
+    # serving steady state.
+    try:
+        reconcile_tick(conn, me)
+    except Exception as exc:  # noqa: BLE001 - main loop will retry
+        print("[%s] startup reconcile error: %r" % (me, exc), file=sys.stderr, flush=True)
+        conn.rollback()
     print("[%s] worker started (poll=%.2fs lease_ttl=%.1fs)" % (me, config.poll_interval(), config.lease_ttl()), flush=True)
     while True:
         try:

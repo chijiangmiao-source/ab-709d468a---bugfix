@@ -7,12 +7,16 @@ the live HTTP API through the required scenarios:
   2. crash recovery (converge a complete staged artifact; clean up a partial one)
   3. business-equivalent retransmission (first receipt, no second artifact)
      and conflict handling (different records or rules snapshot)
+  4. two exports under the SAME rules but with distinct records: each
+     published download must carry only its own export id, input digest,
+     records and artifact digest; then restart app+workers and re-verify
 
 Exits 0 when everything passes, 1 otherwise.
 """
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -22,6 +26,8 @@ import uuid
 
 API = os.environ.get("API_BASE", "http://localhost:8080").rstrip("/")
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
+DOCKER_SOCKET = os.environ.get("DOCKER_SOCKET", "/var/run/docker.sock")
+RESTART_CMD = os.environ.get("RESTART_CMD")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUN = uuid.uuid4().hex[:6]
 
@@ -91,6 +97,110 @@ def tmp_files(export_id):
 
 def download(export_id):
     return req("GET", "/api/exports/%s/artifact" % export_id)
+
+
+# ------------------------------------------------------------------ restart
+
+def _docker_raw(method, path, body=b""):
+    """Minimal Docker Engine API call over the local unix socket."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(15)
+    sock.connect(DOCKER_SOCKET)
+    headers = {
+        "Host": "docker",
+        "Content-Type": "application/json",
+        "Content-Length": str(len(body)),
+        "Connection": "close",
+    }
+    head = "%s %s HTTP/1.1\r\n%s\r\n\r\n" % (
+        method, path, "\r\n".join("%s: %s" % kv for kv in headers.items()))
+    sock.sendall(head.encode("ascii") + body)
+    chunks = []
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    sock.close()
+    raw = b"".join(chunks)
+    head_part, _, payload = raw.partition(b"\r\n\r\n")
+    status_line = head_part.split(b"\r\n", 1)[0].decode("ascii", "replace")
+    status_code = int(status_line.split(" ")[1])
+    # de-chunk trivial responses (Docker JSON is usually sent unchunked here)
+    lowered = head_part.lower()
+    if b"transfer-encoding: chunked" in lowered:
+        out = b""
+        rest = payload
+        while rest:
+            line, _, rest = rest.partition(b"\r\n")
+            if not line:
+                break
+            n = int(line.split(b";", 1)[0], 16)
+            if n == 0:
+                break
+            out += rest[:n]
+            rest = rest[n + 2:]
+        payload = out
+    return status_code, payload
+
+
+def restart_app_and_workers():
+    """Restart the compose app + worker containers; fall back to RESTART_CMD.
+
+    Returns True when a restart was triggered.
+    """
+    if RESTART_CMD:
+        print("restart via RESTART_CMD: %s" % RESTART_CMD, flush=True)
+        proc = subprocess.run(RESTART_CMD, shell=True, capture_output=True, text=True)
+        if proc.stdout:
+            print(proc.stdout)
+        if proc.stderr:
+            print(proc.stderr)
+        return proc.returncode == 0
+    if not os.path.exists(DOCKER_SOCKET):
+        print("no docker socket at %s and RESTART_CMD unset" % DOCKER_SOCKET, flush=True)
+        return False
+    cid = socket.gethostname()
+    status, raw = _docker_raw("GET", "/containers/%s/json" % cid)
+    if status != 200:
+        print("inspect own container failed: %s %s" % (status, raw[:200]), flush=True)
+        return False
+    labels = (json.loads(raw).get("Config", {}).get("Labels") or {})
+    project = labels.get("com.docker.compose.project")
+    if not project:
+        print("own container has no compose project label", flush=True)
+        return False
+    filt = json.dumps({"label": ["com.docker.compose.project=%s" % project]})
+    status, raw = _docker_raw(
+        "GET", "/containers/json?all=1&filters=" + urllib.request.quote(filt, safe=""))
+    if status != 200:
+        print("list project containers failed: %s" % status, flush=True)
+        return False
+    targets = []
+    for c in json.loads(raw):
+        labels = c.get("Labels") or {}
+        service = labels.get("com.docker.compose.service")
+        if c.get("State") == "running" and service in ("app", "worker"):
+            targets.append((c["Id"][:12], service))
+    print("restarting compose services: %s" % targets, flush=True)
+    ok = True
+    for cid12, _name in targets:
+        code, _ = _docker_raw("POST", "/containers/%s/restart?t=2" % cid12)
+        ok = ok and code in (204, 304)
+    return ok
+
+
+def wait_healthy_after_restart():
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        try:
+            status, raw, _ = req("GET", "/healthz")
+            if status == 200 and as_json(raw).get("ok"):
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    return False
 
 
 # ------------------------------------------------------------------ phases
@@ -313,12 +423,184 @@ def smoke():
     check("no temp artifacts left behind", leftovers == [], str(leftovers))
 
 
+def smoke_two_exports_same_rules():
+    """核心场景：同规则、不同记录的两份导出，各自身份/摘要/记录互不串用；
+    错误发布安全收敛；重启后第二份仍可下载、可核验。"""
+    sa, sb = ("SAME%d-%s" % (i, RUN) for i in (1, 3))
+    recs_a = [
+        {"ts": "2026-10-06T02:00:00Z", "lat": 30.11, "lon": 122.01, "depth_m": 11.1, "vessel_id": "HAICE-A"},
+        {"ts": "2026-10-06T02:05:00Z", "lat": 30.12, "lon": 122.02, "depth_m": 11.2, "vessel_id": "HAICE-A"},
+    ]
+    recs_b = [
+        {"ts": "2026-10-06T03:00:00Z", "lat": 41.05, "lon": 113.12, "depth_m": 77.7, "vessel_id": "HAICE-B"},
+        {"ts": "2026-10-06T03:09:00Z", "lat": 41.18, "lon": 113.33, "depth_m": 78.2, "vessel_id": "HAICE-B"},
+    ]
+    rules_r3 = {"rules": [
+        {"field": "depth_m", "action": "redact"},
+        {"field": "vessel_id", "action": "hash", "length": 12},
+    ]}
+
+    def expect_own_artifact(eid, recs, receipt, other_body=None):
+        detail = wait_for_stage(eid, "PUBLISHED", 90)
+        check("%s published" % eid, detail is not None and detail["stage"] == "PUBLISHED",
+              "last=%s" % (detail and detail.get("stage")))
+        code, body, headers = download(eid)
+        check("%s download -> 200" % eid, code == 200, "HTTP %s" % code)
+        if code != 200:
+            return None, None
+        digest_header = headers.get("X-Artifact-Digest")
+        body_digest = hashlib.sha256(body).hexdigest()
+        check("%s X-Artifact-Digest is verifiable" % eid,
+              digest_header == body_digest == detail["artifact_digest"],
+              "header=%s body=%s detail=%s" % (digest_header, body_digest[:16], detail["artifact_digest"][:16]))
+        doc = as_json(body)
+        check("%s artifact binds its own identity" % eid,
+              doc["export_id"] == eid
+              and doc["receipt_id"] == receipt["receipt_id"]
+              and doc["input_digest"] == receipt["input_digest"]
+              and doc["rules_digest"] == receipt["rules_digest"],
+              "doc identity=%s/%s" % (doc.get("export_id"), doc.get("receipt_id")))
+        check("%s artifact carries its own masked records" % eid,
+              [r["ts"] for r in doc["records"]] == [r["ts"] for r in recs]
+              and all(r["depth_m"] == "***" for r in doc["records"])
+              and all(r["vessel_id"] not in ("HAICE-A", "HAICE-B") for r in doc["records"])
+              and doc["records"][0]["lat"] == recs[0]["lat"],
+              "records=%s" % doc.get("records"))
+        check("exactly one published artifact file for %s" % eid,
+              len(published_files(eid)) == 1, str(published_files(eid)))
+        if other_body is not None:
+            check("%s bytes differ from the other export" % eid, body != other_body)
+            other = as_json(other_body)
+            check("%s download contains no foreign identity" % eid,
+                  other["export_id"] not in body.decode("utf-8")
+                  and other["receipt_id"] not in body.decode("utf-8"))
+        return doc, body_digest
+
+    step("同规则两份导出：设置规则 R3（redact depth / hash vessel）")
+    status, raw, _ = req("PUT", "/api/rules", rules_r3)
+    check("put rules R3", status == 200, "HTTP %s %s" % (status, raw[:200]))
+    d3 = as_json(raw)["digest"]
+
+    step("提交并发布 SA（记录集 A）")
+    status, raw, _ = req("POST", "/api/exports", {"export_id": sa, "records": recs_a})
+    check("submit SA -> 201", status == 201, "HTTP %s %s" % (status, raw[:200]))
+    receipt_a = as_json(raw)
+    doc_a, digest_a = expect_own_artifact(sa, recs_a, receipt_a)
+
+    step("同规则、不同记录提交 SB（记录集 B）")
+    status, raw, _ = req("POST", "/api/exports", {"export_id": sb, "records": recs_b})
+    check("submit SB -> 201", status == 201, "HTTP %s" % status)
+    receipt_b = as_json(raw)
+    check("SB froze the same rules snapshot", receipt_b["rules_digest"] == d3 == receipt_a["rules_digest"])
+    check("SB input digest differs from SA", receipt_b["input_digest"] != receipt_a["input_digest"])
+    body_a = download(sa)[1]
+    doc_b, digest_b = expect_own_artifact(sb, recs_b, receipt_b, other_body=body_a)
+    check("SA/SB artifact digests differ", digest_a != digest_b)
+
+    step("SA 业务等价重传仍返回首次回执，不产生第二个工件")
+    reordered_a = [dict(reversed(list(r.items()))) for r in recs_a]
+    status, raw, _ = req("POST", "/api/exports", {"export_id": sa, "records": reordered_a})
+    replay = as_json(raw)
+    check("SA replay -> 200 first receipt",
+          status == 200 and replay.get("replay") is True
+          and replay["receipt_id"] == receipt_a["receipt_id"], "HTTP %s" % status)
+    detail_a = wait_for_stage(sa, "PUBLISHED", 5)
+    check("SA digest/file unchanged after replay",
+          detail_a is not None and detail_a["artifact_digest"] == digest_a
+          and len(published_files(sa)) == 1)
+
+    step("注入历史错误发布：SB 显示 PUBLISHED，但下载字节属于 SA")
+    status, raw, _ = req("POST", "/api/test/corrupt",
+                         {"export_id": sb, "source_export_id": sa})
+    check("corruption injected", status == 202, "HTTP %s %s" % (status, raw[:200]))
+    detail_bad = wait_for_stage(sb, "PUBLISHED", 5)
+    check("SB stays PUBLISHED (stage never regresses)",
+          detail_bad is not None and detail_bad["stage"] == "PUBLISHED")
+    code, body_bad, _ = download(sb)
+    check("corrupted SB download is refused (never serves SA bytes)",
+          code != 200, "unexpected HTTP %s" % code)
+
+    step("后台和解：SB 安全收敛回自己可核验的工件（阶段保持 PUBLISHED）")
+    saw_refusal = False
+    served_foreign = False
+    converged = False
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        detail = wait_for_stage(sb, "PUBLISHED", 1)
+        code, body, _ = download(sb)
+        if code == 200:
+            doc = as_json(body)
+            if doc["export_id"] != sb or doc["input_digest"] != receipt_b["input_digest"]:
+                served_foreign = True
+                break
+            if hashlib.sha256(body).hexdigest() == digest_b:
+                converged = True
+                break
+        elif code in (410, 500):
+            saw_refusal = True
+        check_d = detail
+        if check_d and check_d["stage"] != "PUBLISHED":
+            check("SB stage never leaves PUBLISHED during repair", False, check_d["stage"])
+        time.sleep(0.3)
+    check("unverified cross-export bytes never served", not served_foreign)
+    check("SB converged to its own artifact", converged)
+    if saw_refusal:
+        print("[PASS] download refused during the repair window (410/500 observed)", flush=True)
+    detail_b = wait_for_stage(sb, "PUBLISHED", 5)
+    check("SB stage still PUBLISHED after convergence",
+          detail_b is not None and detail_b["stage"] == "PUBLISHED")
+    events = [e["event"] for e in detail_b.get("events", [])]
+    check("SB journal records the correction", "artifact_corrected" in events, "events=%s" % events)
+    code, body, headers = download(sb)
+    check("SB re-download fully verifiable after convergence",
+          code == 200
+          and headers.get("X-Artifact-Digest") == hashlib.sha256(body).hexdigest() == digest_b
+          and as_json(body)["records"][0]["vessel_id"] != doc_a["records"][0]["vessel_id"]
+          and as_json(body)["records"][0]["ts"] == recs_b[0]["ts"],
+          "HTTP %s" % code)
+    code, body_a2, _ = download(sa)
+    check("SA untouched by SB repair",
+          code == 200 and hashlib.sha256(body_a2).hexdigest() == digest_a)
+
+    step("重启 app 与后台 worker，再次核对两份导出（重点是 SB）")
+    restarted = restart_app_and_workers()
+    check("restart triggered", restarted,
+          "set DOCKER_SOCKET mount or RESTART_CMD to exercise the restart check")
+    if restarted:
+        check("health response after restart", wait_healthy_after_restart())
+        # give restarted workers a startup reconcile tick
+        time.sleep(2)
+        for eid, recs, receipt, want_digest in (
+            (sa, recs_a, receipt_a, digest_a),
+            (sb, recs_b, receipt_b, digest_b),
+        ):
+            detail = wait_for_stage(eid, "PUBLISHED", 30)
+            code, body, headers = download(eid)
+            ok = (
+                detail is not None and detail["stage"] == "PUBLISHED"
+                and code == 200
+                and headers.get("X-Artifact-Digest") == hashlib.sha256(body).hexdigest() == want_digest
+            )
+            if ok:
+                doc = as_json(body)
+                ok = (
+                    doc["export_id"] == eid
+                    and doc["receipt_id"] == receipt["receipt_id"]
+                    and doc["input_digest"] == receipt["input_digest"]
+                    and [r["ts"] for r in doc["records"]] == [r["ts"] for r in recs]
+                    and len(published_files(eid)) == 1
+                )
+            check("%s still correct after restart" % eid, ok,
+                  "stage=%s http=%s" % (detail and detail.get("stage"), code))
+
+
 def main():
     print("verify: one-shot acceptance run %s against %s" % (RUN, API), flush=True)
     build_checks()
     unit_tests()
     wait_for_api()
     smoke()
+    smoke_two_exports_same_rules()
     print("\n==============================================")
     if FAILURES:
         print("verify: FAILED (%d): %s" % (len(FAILURES), ", ".join(FAILURES)), flush=True)

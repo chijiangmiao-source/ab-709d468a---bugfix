@@ -33,9 +33,65 @@ class ProcessTest(WorkerTestBase):
         self.assertEqual("published", result)
         row = store.get_export(self.conn, "E-1")
         self.assertEqual("PUBLISHED", row["stage"])
-        data = artifacts.load_verified(row)  # digest verified
+        data = artifacts.load_verified(row)  # digest + identity verified
         self.assertEqual(hashlib.sha256(data).hexdigest(), row["artifact_digest"])
         self.assertEqual([], artifacts.tmp_files_for("E-1"))
+
+    def test_same_rules_distinct_exports_keep_distinct_identities(self):
+        """The original defect: a second export under the same rules snapshot
+        must never freeze the first export's bytes/digest/identity."""
+        recs1 = [{"ts": "t0", "lat": 31.2, "depth_m": 10, "vessel_id": "V1"}]
+        recs2 = [{"ts": "t1", "lat": 59.3, "depth_m": 22, "vessel_id": "V2"}]
+        _, rcpt1 = store.submit_export(self.conn, "E-1", recs1)
+        _, rcpt2 = store.submit_export(self.conn, "E-2", recs2)
+        self.assertEqual(rcpt1["rules_digest"], rcpt2["rules_digest"])
+        self.assertNotEqual(rcpt1["input_digest"], rcpt2["input_digest"])
+        self.assertNotEqual(rcpt1["receipt_id"], rcpt2["receipt_id"])
+
+        for eid in ("E-1", "E-2"):
+            fencing = store.acquire_lease(self.conn, worker.lease_resource(eid), "w-test", 5)
+            self.assertEqual("published", worker.process_export(self.conn, eid, "w-test", fencing))
+            store.release_lease(self.conn, worker.lease_resource(eid), "w-test", fencing)
+
+        row1 = store.get_export(self.conn, "E-1")
+        row2 = store.get_export(self.conn, "E-2")
+        data1 = artifacts.load_verified(row1)
+        data2 = artifacts.load_verified(row2)
+        self.assertNotEqual(data1, data2)
+        self.assertNotEqual(row1["artifact_digest"], row2["artifact_digest"])
+        import json as _json
+        doc1, doc2 = _json.loads(data1), _json.loads(data2)
+        self.assertEqual(doc1["export_id"], "E-1")
+        self.assertEqual(doc2["export_id"], "E-2")
+        self.assertEqual(doc1["receipt_id"], row1["receipt_id"])
+        self.assertEqual(doc2["receipt_id"], row2["receipt_id"])
+        self.assertEqual(doc1["input_digest"], row1["input_digest"])
+        self.assertEqual(doc2["input_digest"], row2["input_digest"])
+        self.assertEqual(doc1["rules_digest"], doc2["rules_digest"])
+        self.assertEqual(doc1["records"][0]["ts"], "t0")
+        self.assertEqual(doc2["records"][0]["ts"], "t1")
+
+    def test_foreign_bytes_are_refused_even_with_matching_recorded_digest(self):
+        store.submit_export(self.conn, "E-1", [{"ts": "t0", "lat": 31.2}])
+        store.submit_export(self.conn, "E-2", [{"ts": "t9", "lat": 88.8}])
+        f1 = store.acquire_lease(self.conn, worker.lease_resource("E-1"), "w", 5)
+        worker.process_export(self.conn, "E-1", "w", f1)
+        store.release_lease(self.conn, worker.lease_resource("E-1"), "w", f1)
+        row1 = store.get_export(self.conn, "E-1")
+        foreign = artifacts.load_verified(row1)
+        # Simulate the historical mispublication: E-2 recorded with E-1's bytes.
+        with store.immediate(self.conn):
+            store.cas_stage(self.conn, "E-2", "PROCESSING", ("RECEIVED",))
+            store.mark_published(
+                self.conn, "E-2", row1["artifact_digest"],
+                artifacts.published_path("E-2"), "w-bug", "unit",
+            )
+        os.makedirs(os.path.dirname(artifacts.published_path("E-2")), exist_ok=True)
+        with open(artifacts.published_path("E-2"), "wb") as fh:
+            fh.write(foreign)
+        row2 = store.get_export(self.conn, "E-2")
+        with self.assertRaises(artifacts.IdentityMismatch):
+            artifacts.load_verified(row2)
 
     def test_two_workers_publish_exactly_once(self):
         """Two racing worker loops: one export, one published artifact, no regression."""

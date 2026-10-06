@@ -1,4 +1,4 @@
-"""Crash recovery.
+"""Crash recovery and published-artifact reconciliation.
 
 Runs under the export's lease (worker startup and every tick). For each
 unfinished export, consult the journal/artifact records plus on-disk digests:
@@ -9,9 +9,18 @@ unfinished export, consult the journal/artifact records plus on-disk digests:
   atomic link and the DB update) -> converge the bookkeeping;
 * anything else (partial write, digest mismatch, missing file, orphans) ->
   clean up the残缺 artifacts and requeue the export.
+
+PUBLISHED exports are additionally reconciled: the on-disk artifact must hash
+to the digest deterministically recomputed from the frozen decision AND embed
+that decision's identity (export id, first receipt, input/rules digests). A
+PUBLISHED row whose artifact is wrong (e.g. a historical cross-export
+mispublication) is safely converged -- the stage never leaves PUBLISHED, the
+correct bytes are staged and verified first, and the wrong file is preserved
+in quarantine as evidence.
 """
 import hashlib
 import os
+import uuid
 
 from . import artifacts, store
 from .render import render_artifact_bytes
@@ -19,7 +28,8 @@ from .render import render_artifact_bytes
 
 def _expected(export_row):
     data = render_artifact_bytes(export_row)
-    data = artifacts.cache_rendered(export_row["rules_digest"], data)
+    # Defense in depth: freshly rendered bytes must bind to this very decision.
+    artifacts.check_identity(data, export_row)
     return data, hashlib.sha256(data).hexdigest()
 
 
@@ -29,8 +39,55 @@ def _converge(conn, export_id, digest, actor, via):
         store.mark_published(conn, export_id, digest, artifacts.published_path(export_id), actor, via)
 
 
+def reconcile_published(conn, export_id, actor):
+    """Converge a PUBLISHED export to its correct, verifiable artifact.
+
+    Stage never leaves PUBLISHED and no unverified bytes are ever exposed:
+    downloads independently re-check digest + identity, and the correct bytes
+    are fully staged and verified before the live file is atomically replaced.
+    Returns 'converged' when a repair happened, 'none' when already correct.
+    Caller must hold the export's lease.
+    """
+    export = store.get_export(conn, export_id)
+    if not export or export["stage"] != "PUBLISHED":
+        return "none"
+    data, expected_digest = _expected(export)
+    pub = artifacts.published_path(export_id)
+    reason = artifacts.diagnose_published(export, expected_digest)
+    if reason is None:
+        return "none"
+
+    # Stage the correct bytes (re-verify digest + identity ourselves first).
+    artifacts.check_identity(data, export)
+    if hashlib.sha256(data).hexdigest() != expected_digest:
+        raise AssertionError("recomputed artifact failed its own digest check")
+    for stale in artifacts.repair_files_for(export_id):
+        try:
+            os.unlink(stale)
+        except FileNotFoundError:
+            pass
+    tmp = artifacts.tmp_path(export_id, "repair-%s" % uuid.uuid4().hex[:8])
+    staged = None
+    try:
+        artifacts.write_tmp(tmp, data)
+        staged = artifacts.stage_published(tmp, pub, expected_digest)
+        quarantined = artifacts.replace_published(staged, pub, expected_digest)
+        staged = None  # moved onto pub by os.replace
+        store.correct_published_artifact(
+            conn, export_id, expected_digest, pub, actor, reason, quarantined
+        )
+    finally:
+        for path in (tmp, staged):
+            if path:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+    return "converged"
+
+
 def recover_export(conn, export_id, actor):
-    """Recover one export. Caller must hold the export's lease."""
+    """Recover one unfinished export. Caller must hold the export's lease."""
     export = store.get_export(conn, export_id)
     if not export or export["stage"] == "PUBLISHED":
         return "none"
@@ -92,4 +149,10 @@ def sweep_orphans(conn, actor, older_than_seconds=30.0):
     if removed:
         with store.immediate(conn):
             store.journal(conn, None, actor, "recovery_orphan_sweep", "removed=%d" % len(removed))
+    stale_repairs = artifacts.cleanup_repair_files(older_than_seconds=older_than_seconds)
+    if stale_repairs:
+        with store.immediate(conn):
+            store.journal(conn, None, actor, "recovery_stale_repair_sweep",
+                          "removed=%d" % len(stale_repairs))
+        removed.extend(stale_repairs)
     return removed

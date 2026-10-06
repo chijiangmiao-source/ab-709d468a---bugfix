@@ -18,6 +18,7 @@ def render_artifact_bytes(export_row):
     masked = apply_rules(records, rules_doc)
     doc = {
         "export_id": export_row["export_id"],
+        "receipt_id": export_row["receipt_id"],
         "received_at": export_row["received_at"],
         "input_digest": export_row["input_digest"],
         "rules_digest": export_row["rules_digest"],

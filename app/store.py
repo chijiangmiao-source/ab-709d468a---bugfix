@@ -292,6 +292,46 @@ def mark_published(conn, export_id, digest, path, actor, via):
     return True
 
 
+def correct_published_artifact(conn, export_id, digest, path, actor, reason, evidence=None):
+    """Repair bookkeeping for a PUBLISHED export whose artifact was wrong.
+
+    The stage never leaves PUBLISHED (no regression); only the artifact
+    pointers are corrected to the recomputed frozen decision, and the single
+    published artifact row is brought in line. The wrong file's digest and its
+    quarantine path are preserved in the journal as original evidence.
+    """
+    with immediate(conn):
+        row = conn.execute(
+            "SELECT artifact_digest, artifact_path FROM exports WHERE export_id = ? AND stage = 'PUBLISHED'",
+            (export_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        old_digest, old_path = row["artifact_digest"], row["artifact_path"]
+        if old_digest == digest and old_path == path:
+            return False
+        conn.execute(
+            "UPDATE exports SET artifact_digest = ?, artifact_path = ?, updated_at = ? "
+            "WHERE export_id = ? AND stage = 'PUBLISHED'",
+            (digest, path, utcnow(), export_id),
+        )
+        # Bring the single published artifact row in line: correct an existing
+        # one, or insert it when the historical mispublication never recorded it.
+        conn.execute(
+            """INSERT INTO artifacts(export_id, kind, path, digest, created_at)
+               VALUES (?, 'published', ?, ?, ?)
+               ON CONFLICT(export_id) WHERE kind = 'published'
+               DO UPDATE SET path = excluded.path, digest = excluded.digest""",
+            (export_id, path, digest, utcnow()),
+        )
+        journal(
+            conn, export_id, actor, "artifact_corrected",
+            "reason=%s old_digest=%s new_digest=%s evidence=%s"
+            % (reason, old_digest, digest, evidence),
+        )
+        return True
+
+
 # ---------------------------------------------------------------- leases
 
 def acquire_lease(conn, resource, owner, ttl_seconds):
@@ -366,6 +406,14 @@ def abort_artifact(conn, artifact_id):
 def stuck_exports(conn):
     rows = conn.execute(
         "SELECT export_id, stage FROM exports WHERE stage IN ('PROCESSING','STAGED') ORDER BY updated_at"
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def published_exports(conn, limit=500):
+    rows = conn.execute(
+        "SELECT export_id FROM exports WHERE stage = 'PUBLISHED' ORDER BY published_at, export_id LIMIT ?",
+        (limit,),
     ).fetchall()
     return [dict(row) for row in rows]
 

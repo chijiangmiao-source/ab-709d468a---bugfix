@@ -17,7 +17,7 @@ import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from . import artifacts, config, masking, store
+from . import artifacts, config, masking, store, testing
 
 MAX_BODY = 1 << 20
 MAX_RECORDS = 100
@@ -212,9 +212,11 @@ class Handler(BaseHTTPRequestHandler):
         except artifacts.ArtifactMissing:
             self._send_error_json(410, "artifact_missing", "published artifact file is gone")
             return
-        except artifacts.DigestMismatch:
+        except (artifacts.DigestMismatch, artifacts.IdentityMismatch) as exc:
+            # Never serve bytes whose digest or embedded identity do not bind
+            # them to this exact export; background reconciliation repairs it.
             self._send_error_json(500, "artifact_unverified",
-                                  "artifact failed digest verification; refusing to serve")
+                                  "artifact failed verification; refusing to serve: %s" % exc)
             return
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -266,6 +268,24 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 conn.close()
             self._send_json(202, {"ok": True, "export_id": export_id, "mode": mode})
+            return
+        if method == "POST" and path == "/api/test/corrupt":
+            if not config.test_hooks():
+                self._send_error_json(404, "not_found", "test hooks disabled")
+                return
+            target_id = doc.get("export_id")
+            source_id = doc.get("source_export_id")
+            if not isinstance(target_id, str) or not isinstance(source_id, str):
+                raise ApiError(422, "invalid_corrupt",
+                               "need export_id and source_export_id strings")
+            conn = store.connect()
+            try:
+                payload = testing.inject_cross_export_artifact(conn, target_id, source_id)
+            except testing.TestHookError as exc:
+                raise ApiError(exc.status, exc.code, exc.message)
+            finally:
+                conn.close()
+            self._send_json(202, {"ok": True, **payload})
             return
         self._send_error_json(404, "not_found", "no such route: %s %s" % (method, path))
 

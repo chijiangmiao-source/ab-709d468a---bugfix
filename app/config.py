@@ -22,10 +22,6 @@ def published_dir():
     return os.path.join(artifacts_dir(), "published")
 
 
-def render_cache_dir():
-    return os.path.join(artifacts_dir(), "render-cache")
-
-
 def quarantine_dir():
     return os.path.join(artifacts_dir(), "quarantine")
 
@@ -48,5 +44,5 @@ def test_hooks():
 
 
 def ensure_dirs():
-    for path in (data_dir(), tmp_dir(), published_dir(), render_cache_dir(), quarantine_dir()):
+    for path in (data_dir(), tmp_dir(), published_dir(), quarantine_dir()):
         os.makedirs(path, exist_ok=True)
