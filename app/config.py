@@ -22,10 +22,6 @@ def published_dir():
     return os.path.join(artifacts_dir(), "published")
 
 
-def render_cache_dir():
-    return os.path.join(artifacts_dir(), "render-cache")
-
-
 def quarantine_dir():
     return os.path.join(artifacts_dir(), "quarantine")
 
@@ -42,11 +38,16 @@ def poll_interval():
     return float(os.environ.get("POLL_INTERVAL_SECONDS", "0.5"))
 
 
+def repair_interval():
+    """How often a worker re-audits already-published artifacts."""
+    return float(os.environ.get("REPAIR_INTERVAL_SECONDS", "30"))
+
+
 def test_hooks():
     """Fault-injection endpoints are only available when explicitly enabled."""
     return os.environ.get("TEST_HOOKS", "") == "1"
 
 
 def ensure_dirs():
-    for path in (data_dir(), tmp_dir(), published_dir(), render_cache_dir(), quarantine_dir()):
+    for path in (data_dir(), tmp_dir(), published_dir(), quarantine_dir()):
         os.makedirs(path, exist_ok=True)

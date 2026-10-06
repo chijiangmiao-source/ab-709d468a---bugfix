@@ -3,13 +3,19 @@
 Publish uses hard-link + unlink on the same filesystem: atomic, and it never
 clobbers an already-published artifact (second publisher gets FileExistsError
 and must verify the existing digest instead).
+
+There is deliberately NO cross-export render cache: an artifact's bytes are
+specific to one frozen decision (export id, input digest, rules snapshot,
+first receipt), so caching them under a rules-only key would let one export
+download another export's identity and records.
 """
 import hashlib
+import json
 import os
 import time
-import uuid
 
 from . import config
+from .render import artifact_integrity_digest
 
 
 class PublishedMismatch(Exception):
@@ -22,6 +28,10 @@ class ArtifactMissing(Exception):
 
 class DigestMismatch(Exception):
     pass
+
+
+class PublishedIdentityMismatch(DigestMismatch):
+    """An artifact file does not belong to the export it was found under."""
 
 
 def sha256_bytes(data):
@@ -42,34 +52,6 @@ def tmp_path(export_id, token):
 
 def published_path(export_id):
     return os.path.join(config.published_dir(), "%s.json" % export_id)
-
-
-def rendered_cache_path(rules_digest):
-    return os.path.join(config.render_cache_dir(), "%s.json" % rules_digest)
-
-
-def cache_rendered(rules_digest, data):
-    path = rendered_cache_path(rules_digest)
-    try:
-        with open(path, "rb") as fh:
-            return fh.read()
-    except FileNotFoundError:
-        pass
-
-    candidate = "%s.%s.part" % (path, uuid.uuid4().hex)
-    write_tmp(candidate, data)
-    try:
-        os.link(candidate, path)
-    except FileExistsError:
-        with open(path, "rb") as fh:
-            data = fh.read()
-    finally:
-        try:
-            os.unlink(candidate)
-        except FileNotFoundError:
-            pass
-    _fsync_dir(os.path.dirname(path))
-    return data
 
 
 def write_tmp(path, data):
@@ -153,10 +135,35 @@ def list_published_files():
     return [os.path.join(directory, name) for name in os.listdir(directory) if name.endswith(".json")]
 
 
-def load_verified(export_row):
-    """Read a published artifact only when its digest matches the frozen record.
+def embedded_identity_digest(data):
+    """Extract the integrity digest embedded in a rendered artifact, or None."""
+    try:
+        doc = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    value = doc.get("integrity_digest") if isinstance(doc, dict) else None
+    return value if isinstance(value, str) else None
 
-    The download path must never expose unverified content.
+
+def artifact_identity_ok(data, export_row):
+    """The bytes must certify they were rendered for THIS frozen decision.
+
+    This is what stops a valid-but-foreign artifact (e.g. another export's
+    records under the same rules) from being served from this export's path.
+    """
+    embedded = embedded_identity_digest(data)
+    if embedded is None:
+        return False
+    return embedded == artifact_integrity_digest(export_row)
+
+
+def load_verified(export_row):
+    """Read a published artifact only when it certifies the frozen decision.
+
+    The download path must never expose unverified or foreign content: both
+    the on-disk content digest (vs. the frozen artifact_digest) and the
+    embedded identity (vs. export id / input / rules / first receipt) must
+    match.
     """
     path = export_row.get("artifact_path")
     if not path or not os.path.exists(path):
@@ -165,4 +172,6 @@ def load_verified(export_row):
         data = fh.read()
     if sha256_bytes(data) != export_row.get("artifact_digest"):
         raise DigestMismatch("artifact digest mismatch")
+    if not artifact_identity_ok(data, export_row):
+        raise PublishedIdentityMismatch("artifact does not certify this export decision")
     return data

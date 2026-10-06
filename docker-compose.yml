@@ -27,6 +27,7 @@ services:
       TEST_HOOKS: "1"
       LEASE_TTL_SECONDS: "8"
       POLL_INTERVAL_SECONDS: "0.5"
+      REPAIR_INTERVAL_SECONDS: "5"
     volumes:
       - data:/data
     restart: on-failure        # crashed workers restart and run recovery
@@ -46,6 +47,7 @@ services:
       DATA_DIR: /data
     volumes:
       - data:/data:ro
+      - /var/run/docker.sock:/var/run/docker.sock   # acceptance restarts app+workers, then re-checks
     restart: "no"              # one-shot: runs the acceptance suite and exits
 
 volumes:

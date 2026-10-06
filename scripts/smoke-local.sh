@@ -12,10 +12,10 @@ DATA_DIR="$DATA" PORT="$PORT" TEST_HOOKS=1 python3 -m app.server &
 APP_PID=$!
 
 # restart loop mimics compose `restart: on-failure` for crash-injection scenarios
-DATA_DIR="$DATA" TEST_HOOKS=1 LEASE_TTL_SECONDS=8 POLL_INTERVAL_SECONDS=0.3 \
+DATA_DIR="$DATA" TEST_HOOKS=1 LEASE_TTL_SECONDS=8 POLL_INTERVAL_SECONDS=0.3 REPAIR_INTERVAL_SECONDS=2 \
   sh -c 'while true; do python3 -m app.worker; sleep 1; done' &
 W1_PID=$!
-DATA_DIR="$DATA" TEST_HOOKS=1 LEASE_TTL_SECONDS=8 POLL_INTERVAL_SECONDS=0.3 \
+DATA_DIR="$DATA" TEST_HOOKS=1 LEASE_TTL_SECONDS=8 POLL_INTERVAL_SECONDS=0.3 REPAIR_INTERVAL_SECONDS=2 \
   sh -c 'while true; do python3 -m app.worker; sleep 1; done' &
 W2_PID=$!
 

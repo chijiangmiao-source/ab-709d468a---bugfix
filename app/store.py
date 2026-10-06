@@ -397,3 +397,39 @@ def pop_fault(conn, export_id, mode):
             conn.execute("DELETE FROM faults WHERE export_id = ?", (export_id,))
             return True
     return False
+
+
+def plant_foreign_published(conn, victim_id, donor_id, actor="api"):
+    """Test hook: reproduce the legacy render-cache corruption on disk.
+
+    After it runs, the victim is still PUBLISHED and its stored
+    artifact_digest matches the file's bytes (so a digest-only check passes),
+    but the bytes are the DONOR export's artifact: wrong export id, input
+    digest and records. Startup audit / download identity verification then
+    prove safe convergence. Returns the donor digest, or raises ValueError.
+    """
+    import shutil
+
+    victim = get_export(conn, victim_id)
+    donor = get_export(conn, donor_id)
+    if not victim or not donor:
+        raise ValueError("both export ids must exist")
+    if victim["stage"] != "PUBLISHED" or donor["stage"] != "PUBLISHED":
+        raise ValueError("both exports must be PUBLISHED")
+    if victim_id == donor_id:
+        raise ValueError("donor must be a different export")
+    donor_path = donor["artifact_path"]
+    victim_path = victim["artifact_path"]
+    if not donor_path or not os.path.exists(donor_path):
+        raise ValueError("donor artifact file is missing")
+    shutil.copyfile(donor_path, victim_path)
+    with immediate(conn):
+        conn.execute(
+            "UPDATE exports SET artifact_digest = ?, updated_at = ? WHERE export_id = ?",
+            (donor["artifact_digest"], utcnow(), victim_id),
+        )
+        journal(
+            conn, victim_id, actor, "test_foreign_published_planted",
+            "donor=%s donor_digest=%s" % (donor_id, donor["artifact_digest"]),
+        )
+    return donor["artifact_digest"]

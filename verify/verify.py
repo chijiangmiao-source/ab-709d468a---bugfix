@@ -13,6 +13,7 @@ Exits 0 when everything passes, 1 otherwise.
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -22,6 +23,8 @@ import uuid
 
 API = os.environ.get("API_BASE", "http://localhost:8080").rstrip("/")
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
+DOCKER_SOCKET = os.environ.get("DOCKER_SOCKET", "/var/run/docker.sock")
+RESTART_SERVICES = ("app", "worker")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUN = uuid.uuid4().hex[:6]
 
@@ -93,6 +96,105 @@ def download(export_id):
     return req("GET", "/api/exports/%s/artifact" % export_id)
 
 
+# ------------------------------------------------- Docker (compose) restart
+
+def _unix_http_connection():
+    import http.client
+
+    class UnixHTTPConnection(http.client.HTTPConnection):
+        def __init__(self, socket_path):
+            super().__init__("localhost")
+            self._socket_path = socket_path
+
+        def connect(self):
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.connect(self._socket_path)
+            self.sock.settimeout(30)
+
+    return UnixHTTPConnection
+
+
+def docker_call(method, path, body=None):
+    """Call the Docker Engine API over the mounted unix socket."""
+    conn = _unix_http_connection()(DOCKER_SOCKET)
+    headers = {}
+    payload = None
+    if body is not None:
+        payload = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    conn.request(method, path, body=payload, headers=headers)
+    resp = conn.getresponse()
+    raw = resp.read()
+    conn.close()
+    return resp.status, raw
+
+
+def self_container_id():
+    """Best-effort discovery of this process's full container id.
+
+    Docker sets HOSTNAME to the 12-char short id; /proc/self/cgroup carries the
+    full id on cgroup v1/v2 (fallback)."""
+    short = os.environ.get("HOSTNAME", "")
+    status, raw = docker_call("GET", "/containers/json?all=1")
+    if status == 200:
+        for container in json.loads(raw):
+            cid = container.get("Id", "")
+            if len(short) == 12 and cid.startswith(short):
+                return cid
+    try:
+        import re
+
+        with open("/proc/self/cgroup") as fh:
+            text = fh.read()
+        match = re.search(r"[0-9a-f]{64}", text)
+        if match:
+            return match.group(0)
+    except OSError:
+        pass
+    return None
+
+
+def compose_targets():
+    """Return [(container_id, service)] for app+worker in this compose project."""
+    cid = self_container_id()
+    project = None
+    if cid:
+        status, raw = docker_call("GET", "/containers/%s/json" % cid)
+        if status == 200:
+            labels = json.loads(raw).get("Config", {}).get("Labels", {})
+            project = labels.get("com.docker.compose.project")
+    status, raw = docker_call("GET", "/containers/json?all=1")
+    if status != 200:
+        raise RuntimeError("docker list failed: %s %s" % (status, raw[:200]))
+    targets = []
+    for container in json.loads(raw):
+        labels = container.get("Labels") or {}
+        if project and labels.get("com.docker.compose.project") != project:
+            continue
+        service = labels.get("com.docker.compose.service")
+        if service in RESTART_SERVICES:
+            targets.append((container["Id"], service, container.get("Names") or ["?"]))
+    return targets
+
+
+def restart_compose_services():
+    """Restart app + worker containers through the Docker socket."""
+    targets = compose_targets()
+    restarted = []
+    for cid, service, names in targets:
+        status, raw = docker_call("POST", "/containers/%s/restart?t=5" % cid)
+        if status not in (204, 304):
+            raise RuntimeError("restart %s failed: %s %s" % (names[0], status, raw[:200]))
+        restarted.append("%s(%s)" % (service, names[0].lstrip("/")))
+    if not restarted:
+        raise RuntimeError("no app/worker compose containers found to restart")
+    return restarted
+
+
+def docker_available():
+    return os.path.exists(DOCKER_SOCKET)
+
+
 # ------------------------------------------------------------------ phases
 
 def build_checks():
@@ -137,9 +239,18 @@ def wait_for_api():
 
 def smoke():
     e1, e2, e3, e4, e5 = ("VFY%d-%s" % (i, RUN) for i in range(1, 6))
+    s1, s2 = "VFY6-%s" % RUN, "VFY7-%s" % RUN
     recs = [
         {"ts": "2026-10-06T01:00:00Z", "lat": 31.230416, "lon": 121.473701, "depth_m": 42.51, "vessel_id": "HAICE-01"},
         {"ts": "2026-10-06T01:05:00Z", "lat": 31.231102, "lon": 121.480233, "depth_m": 43.04, "vessel_id": "HAICE-01"},
+    ]
+    same_rules_recs_a = [
+        {"ts": "2026-10-06T02:00:00Z", "lat": 30.1001, "lon": 120.0001, "depth_m": 11.1, "vessel_id": "SHIP-X"},
+        {"ts": "2026-10-06T02:05:00Z", "lat": 30.1011, "lon": 120.0011, "depth_m": 12.2, "vessel_id": "SHIP-X"},
+    ]
+    same_rules_recs_b = [
+        {"ts": "2026-10-06T03:00:00Z", "lat": 35.9009, "lon": 130.9009, "depth_m": 77.7, "vessel_id": "SHIP-Y"},
+        {"ts": "2026-10-06T03:09:00Z", "lat": 35.9099, "lon": 130.9099, "depth_m": 78.8, "vessel_id": "SHIP-Z"},
     ]
     rules_r1 = {"rules": [
         {"field": "depth_m", "action": "redact"},
@@ -191,6 +302,138 @@ def smoke():
               doc["rules_digest"] == d1 and doc["input_digest"] == receipt1["input_digest"])
     check("exactly one published artifact file for E1", len(published_files(e1)) == 1,
           str(published_files(e1)))
+
+    step("同规则两份导出（S1→等待发布→S2）：最终工件身份互不串用")
+    status, _, _ = req("POST", "/api/exports", {"export_id": s1, "records": same_rules_recs_a})
+    check("submit S1 -> 201", status == 201, "HTTP %s" % status)
+    sd1 = wait_for_stage(s1, "PUBLISHED", 90)
+    check("S1 published before S2 is submitted", sd1 is not None and sd1["stage"] == "PUBLISHED",
+          "last=%s" % (sd1 and sd1.get("stage")))
+    status, _, _ = req("POST", "/api/exports", {"export_id": s2, "records": same_rules_recs_b})
+    check("submit S2 -> 201", status == 201, "HTTP %s" % status)
+    sd2 = wait_for_stage(s2, "PUBLISHED", 90)
+    check("S2 published", sd2 is not None and sd2["stage"] == "PUBLISHED")
+
+    def assert_download_identity(tag, export_id, records, frozen_digest, input_digest):
+        code, body, headers = download(export_id)
+        ok = code == 200
+        check("%s: download -> 200" % tag, ok, "HTTP %s" % code)
+        if not ok:
+            return None
+        served_digest = headers.get("X-Artifact-Digest")
+        check("%s: X-Artifact-Digest matches bytes" % tag,
+              hashlib.sha256(body).hexdigest() == served_digest == frozen_digest,
+              "header=%s frozen=%s" % (served_digest, frozen_digest))
+        doc = as_json(body)
+        check("%s: artifact export_id is its own id" % tag, doc.get("export_id") == export_id,
+              "got=%r" % doc.get("export_id"))
+        check("%s: input_digest is its own frozen input" % tag,
+              doc.get("input_digest") == input_digest)
+        # Compare fields R1 leaves untouched (ts/lat/lon); vessel_id is hashed
+        # and depth_m redacted by the frozen rules.
+        got = [(r.get("ts"), r.get("lat"), r.get("lon")) for r in doc.get("records", [])]
+        want = [(r["ts"], r["lat"], r["lon"]) for r in records]
+        check("%s: records are its own masked records (identity by ts/lat/lon)" % tag,
+              got == want and doc.get("record_count") == len(records),
+              "got=%r" % got)
+        check("%s: R1 masking applied (vessel hashed, depth redacted)" % tag,
+              all(r.get("vessel_id") != src["vessel_id"] and len(r.get("vessel_id", "")) == 10
+                  for r, src in zip(doc.get("records", []), records))
+              and all(r.get("depth_m") == "***" for r in doc.get("records", [])))
+        check("%s: carries integrity digest" % tag, isinstance(doc.get("integrity_digest"), str))
+        return doc
+
+    assert_download_identity("S1", s1, same_rules_recs_a,
+                             sd1["artifact_digest"], sd1["input_digest"])
+    assert_download_identity("S2", s2, same_rules_recs_b,
+                             sd2["artifact_digest"], sd2["input_digest"])
+    check("S1 and S2 have distinct artifact digests",
+          sd1["artifact_digest"] != sd2["artifact_digest"])
+    check("S1/S2 share the frozen rules digest (same rules)", sd1["rules_digest"] == sd2["rules_digest"])
+    check("S1/S2 have distinct input digests", sd1["input_digest"] != sd2["input_digest"])
+
+    step("植入历史错误态：S2 显示 PUBLISHED 但文件/摘要实为 S1 的工件")
+    status, raw, _ = req("POST", "/api/test/corrupt", {"export_id": s2, "donor_id": s1})
+    planted = status == 202
+    check("plant foreign published artifact (S2<-S1)", planted, "HTTP %s %s" % (status, raw[:200]))
+    if planted:
+        planted_digest = as_json(raw)["artifact_digest"]
+        check("planted digest equals S1 digest", planted_digest == sd1["artifact_digest"])
+        code, body, _ = download(s2)
+        if code == 200:
+            served = as_json(body)
+            # The one property that must hold no matter how fast the audit ran:
+            # a 200 can never carry the FIRST export's identity/records. If the
+            # periodic audit already repaired it, we must see S2's own bytes.
+            check("PUBLISHED download never leaks the first export's identity",
+                  served.get("export_id") == s2,
+                  "got foreign export_id=%r" % served.get("export_id"))
+        else:
+            # digest-valid foreign bytes are refused until a worker repairs them
+            check("download refuses foreign PUBLISHED content", code in (409, 410, 500),
+                  "HTTP %s" % code)
+        d = wait_for_stage(s2, "PUBLISHED", 3)
+        check("S2 stage stays PUBLISHED (never regressed)", d is not None and d["stage"] == "PUBLISHED")
+
+        step("重启 app 与 2×worker，随后再核对第二份导出")
+        if docker_available():
+            try:
+                names = restart_compose_services()
+                check("restart app + workers via docker socket", bool(names), str(names))
+            except Exception as exc:
+                check("restart app + workers via docker socket", False, repr(exc)[:300])
+        else:
+            # Local (non-Compose) runs cannot restart containers; the same
+            # repair code runs in the live workers' startup/periodic audit, so
+            # convergence below still exercises the identical path.
+            print("[note] %s absent (local run): relying on running worker audit" % DOCKER_SOCKET,
+                  flush=True)
+
+        # the app itself must come back healthy regardless of workers
+        deadline = time.time() + 90
+        healthy = False
+        while time.time() < deadline:
+            code, raw, _ = req("GET", "/healthz")
+            if code == 200 and as_json(raw).get("ok"):
+                healthy = True
+                break
+            time.sleep(1)
+        check("health response after restart", healthy)
+
+        # worker startup/periodic audit converges S2 to its own artifact
+        sd2_after = wait_for_stage(s2, "PUBLISHED", 120)
+        check("S2 still PUBLISHED after restart", sd2_after is not None and sd2_after["stage"] == "PUBLISHED")
+        deadline = time.time() + 120
+        converged = None
+        while time.time() < deadline:
+            code, body, headers = download(s2)
+            if code == 200:
+                doc = as_json(body)
+                if doc.get("export_id") == s2:
+                    converged = (code, body, headers, doc)
+                    break
+            time.sleep(1)
+        check("S2 converges to its own downloadable, verifiable artifact", converged is not None)
+        if converged:
+            code, body, headers, doc = converged
+            check("S2 repaired digest differs from foreign S1 digest",
+                  headers.get("X-Artifact-Digest") != planted_digest
+                  and hashlib.sha256(body).hexdigest() == headers.get("X-Artifact-Digest"))
+            check("S2 repaired artifact is the originally rendered S2 artifact",
+                  headers.get("X-Artifact-Digest") == sd2["artifact_digest"])
+            check("S2 repaired records are S2 records (ts/lat/lon)",
+                  [(r.get("ts"), r.get("lat"), r.get("lon")) for r in doc["records"]]
+                  == [(r["ts"], r["lat"], r["lon"]) for r in same_rules_recs_b])
+            check("S2 repaired input_digest is its own",
+                  doc.get("input_digest") == sd2["input_digest"])
+        code, body, _ = download(s1)
+        check("S1 download untouched by S2 repair (identity + digest)",
+              code == 200 and as_json(body).get("export_id") == s1
+              and hashlib.sha256(body).hexdigest() == sd1["artifact_digest"])
+        d = wait_for_stage(s2, "PUBLISHED", 3)
+        check("S2 never regressed and stays terminal", d["stage"] == "PUBLISHED")
+        check("quarantine holds the displaced foreign artifact",
+              len(os.listdir(os.path.join(DATA_DIR, "artifacts", "quarantine"))) >= 1)
 
     step("值班员改规则 → R2（遮蔽 lat）")
     status, raw, _ = req("PUT", "/api/rules", rules_r2)

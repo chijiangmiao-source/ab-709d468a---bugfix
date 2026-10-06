@@ -39,7 +39,6 @@ def process_export(conn, export_id, me, fencing):
 
     export = store.get_export(conn, export_id)
     data = render_artifact_bytes(export)
-    data = artifacts.cache_rendered(export["rules_digest"], data)
     digest = hashlib.sha256(data).hexdigest()
     tmp = artifacts.tmp_path(export_id, uuid.uuid4().hex[:8])
 
@@ -77,10 +76,17 @@ def process_export(conn, export_id, me, fencing):
             store.journal(conn, export_id, me, "lease_lost", None)
         return "lease_lost"
 
-    via = artifacts.publish(tmp, artifacts.published_path(export_id), digest)
+    # Publish only bytes that certify this export's frozen decision. A foreign
+    # file already at the path is quarantined (evidence preserved), never served.
+    try:
+        pub, via = recovery.publish_verified_artifact(conn, export, data, digest, tmp, me)
+    except artifacts.PublishedMismatch:
+        with store.immediate(conn):
+            store.journal(conn, export_id, me, "publish_conflict", artifacts.published_path(export_id))
+        return "publish_conflict"
     with store.immediate(conn):
-        store.record_artifact(conn, export_id, "published", artifacts.published_path(export_id), digest)
-        store.mark_published(conn, export_id, digest, artifacts.published_path(export_id), me, via)
+        store.record_artifact(conn, export_id, "published", pub, digest)
+        store.mark_published(conn, export_id, digest, pub, me, via)
     return "published"
 
 
@@ -117,10 +123,20 @@ def run_forever(me=None):
     conn = store.connect()
     store.init_db(conn)
     recovery.sweep_orphans(conn, me)
+    # Restart convergence: any PUBLISHED export whose artifact is missing or
+    # certifies another export is rebuilt from its frozen decision here.
+    repaired = recovery.audit_published(conn, me)
+    if repaired:
+        print("[%s] startup audit repaired %d published export(s): %s"
+              % (me, len(repaired), ",".join(repaired)), flush=True)
     print("[%s] worker started (poll=%.2fs lease_ttl=%.1fs)" % (me, config.poll_interval(), config.lease_ttl()), flush=True)
+    last_audit = time.time()
     while True:
         try:
             tick(conn, me)
+            if time.time() - last_audit >= config.repair_interval():
+                recovery.audit_published(conn, me)
+                last_audit = time.time()
         except Exception as exc:  # keep the loop alive; next tick retries
             print("[%s] tick error: %r" % (me, exc), file=sys.stderr, flush=True)
             try:

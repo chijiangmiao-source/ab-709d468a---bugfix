@@ -267,6 +267,27 @@ class Handler(BaseHTTPRequestHandler):
                 conn.close()
             self._send_json(202, {"ok": True, "export_id": export_id, "mode": mode})
             return
+        if method == "POST" and path == "/api/test/corrupt":
+            if not config.test_hooks():
+                self._send_error_json(404, "not_found", "test hooks disabled")
+                return
+            victim_id = doc.get("export_id")
+            donor_id = doc.get("donor_id")
+            if not isinstance(victim_id, str) or not isinstance(donor_id, str):
+                raise ApiError(422, "invalid_corrupt", "need export_id (victim) and donor_id")
+            conn = store.connect()
+            try:
+                donor_digest = store.plant_foreign_published(conn, victim_id, donor_id)
+            except ValueError as exc:
+                self._send_error_json(422, "invalid_corrupt", str(exc))
+                return
+            finally:
+                conn.close()
+            self._send_json(202, {
+                "ok": True, "export_id": victim_id, "donor_id": donor_id,
+                "artifact_digest": donor_digest,
+            })
+            return
         self._send_error_json(404, "not_found", "no such route: %s %s" % (method, path))
 
 
